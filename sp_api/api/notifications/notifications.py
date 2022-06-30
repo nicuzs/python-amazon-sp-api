@@ -50,9 +50,14 @@ class Notifications(Client):
             'destinationId': kwargs.pop('destinationId', destination_id),
             'payloadVersion': kwargs.pop('payload_version', '1.0')
         }
-        return self._request(fill_query_params(kwargs.pop('path'),
-                                               notification_type if isinstance(notification_type,
-                                                                               str) else notification_type.value),
+        # Forwarding processing directives only for ANY_OFFER_CHANGED notifications
+        notification_type = notification_type if isinstance(notification_type, str)\
+            else notification_type.value
+        processing_directive = kwargs.pop('processing_directive', None)
+        if processing_directive and notification_type == NotificationType.ANY_OFFER_CHANGED:
+            data['processingDirective'] = processing_directive
+
+        return self._request(fill_query_params(kwargs.pop('path'), notification_type),
                              data={**kwargs, **data})
 
     @sp_endpoint('/notifications/v1/subscriptions/{}')
