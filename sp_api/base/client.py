@@ -7,6 +7,7 @@ import os
 from json import JSONDecodeError
 
 import boto3
+from botocore.config import Config
 from cachetools import TTLCache
 from requests import request
 
@@ -39,27 +40,44 @@ class Client(BaseClient):
             credentials=None,
             restricted_data_token=None,
             proxies=None,
+            verify=True,
+            timeout=None,
             version=None
     ):
+        if os.environ.get('SP_API_DEFAULT_MARKETPLACE', None):
+            marketplace = Marketplaces[os.environ.get('SP_API_DEFAULT_MARKETPLACE')]
         self.credentials = CredentialProvider(account, credentials).credentials
+        boto_config = Config(
+            proxies=proxies,
+        )
         session = boto3.session.Session()
+
         if not (self.credentials.aws_access_key and self.credentials.aws_secret_key):
             # if no credentials are provided, allow boto to use env variables or no auth at all
-            self.boto3_client = session.client('sts')
+            self.boto3_client = session.client(
+                'sts',
+                verify=verify,
+                config=boto_config,
+                )
         else:
             self.boto3_client = session.client(
                 'sts',
                 aws_access_key_id=self.credentials.aws_access_key,
                 aws_secret_access_key=self.credentials.aws_secret_key,
                 aws_session_token=self.credentials.aws_session_token,
+                config=boto_config,
+                verify=verify,
             )
+
         self.endpoint = marketplace.endpoint
         self.marketplace_id = marketplace.marketplace_id
         self.region = marketplace.region
         self.restricted_data_token = restricted_data_token
-        self._auth = AccessTokenClient(refresh_token=refresh_token, credentials=self.credentials)
+        self._auth = AccessTokenClient(refresh_token=refresh_token, credentials=self.credentials, proxies=proxies, verify=verify)
         self.proxies = proxies
+        self.timeout = timeout
         self.version = version
+        self.verify = verify
 
     def _get_cache_key(self, token_flavor=''):
         return 'role_' + hashlib.md5(
@@ -120,13 +138,16 @@ class Client(BaseClient):
                         )
 
     def _request(self, path: str, *, data: dict = None, params: dict = None, headers=None,
-                 add_marketplace=True, res_no_data: bool = False, bulk: bool = False) -> ApiResponse:
+                 add_marketplace=True, res_no_data: bool = False, bulk: bool = False,
+                 wrap_list: bool = False) -> ApiResponse:
         if params is None:
             params = {}
         if data is None:
             data = {}
 
-        self.method = params.pop('method', data.pop('method', 'GET'))
+        # Note: The use of isinstance here is to support request schemas that are an array at the
+        # top level, eg get_product_fees_estimate 
+        self.method = params.pop('method', data.pop('method', 'GET') if isinstance(data, dict) else 'GET')
 
         if add_marketplace:
             self._add_marketplaces(data if self.method in ('POST', 'PUT') else params)
@@ -137,10 +158,13 @@ class Client(BaseClient):
                       data=json.dumps(data) if data and self.method in ('POST', 'PUT', 'PATCH') else None,
                       headers=headers or self.headers,
                       auth=self._sign_request(),
-                      proxies=self.proxies)
-        return self._check_response(res, res_no_data, bulk)
+                      timeout=self.timeout,
+                      proxies=self.proxies,
+                      verify=self.verify)
+        return self._check_response(res, res_no_data, bulk, wrap_list)
 
-    def _check_response(self, res, res_no_data: bool = False, bulk: bool = False) -> ApiResponse:
+    def _check_response(self, res, res_no_data: bool = False, bulk: bool = False,
+                        wrap_list: bool = False) -> ApiResponse:
         if (self.method == 'DELETE' or res_no_data) and 200 <= res.status_code < 300:
             try:
                 js = res.json() or {}
@@ -148,8 +172,13 @@ class Client(BaseClient):
                 js = {'status_code': res.status_code}
         else:
             js = res.json() or {}
+
         if isinstance(js, list):
-            js = js[0]
+            if wrap_list:
+                # Support responses that are an array at the top level, eg get_product_fees_estimate
+                js = dict(payload = js)
+            else:
+                js = js[0]
 
         error = js.get('errors', None)
 
